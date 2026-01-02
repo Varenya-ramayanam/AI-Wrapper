@@ -1,6 +1,4 @@
 import * as vscode from "vscode";
-import * as fs from "fs";
-import * as path from "path";
 import { getAIPoweredBotResponse } from "./aiIntegration";
 import { scanForVulnerabilities, SecurityIssue } from "./securityScanner";
 
@@ -18,11 +16,9 @@ function sanitizeAIOutput(raw: string): string {
   let code = raw;
 
   // Remove markdown code fences
-  code = code.replace(/```[\s\S]*?```/g, block =>
-    block.replace(/```/g, "")
-  );
+  code = code.replace(/```[\s\S]*?```/g, b => b.replace(/```/g, ""));
 
-  // Remove markdown bullets & headings
+  // Remove markdown bullets / headings
   code = code.replace(/^[-*#].*$/gm, "");
 
   // Remove ALL block comments (even unterminated)
@@ -31,7 +27,7 @@ function sanitizeAIOutput(raw: string): string {
   // Remove single-line comments
   code = code.replace(/\/\/.*$/gm, "");
 
-  // Remove common LLM chatter
+  // Remove LLM chatter
   code = code.replace(
     /\b(here is|this code|example|explanation|sure|below|note that)\b/gi,
     ""
@@ -51,23 +47,22 @@ function sanitizeAIOutput(raw: string): string {
 }
 
 // ==============================
-// Pre-block CRITICAL patterns
+// Critical pattern block
 // ==============================
 function containsCriticalPatterns(code: string): boolean {
   const dangerous = [
     "eval(",
     "Function(",
     "child_process.exec(",
-    "innerHTML",
     "document.write(",
+    "innerHTML",
     "new Buffer("
   ];
-
   return dangerous.some(p => code.includes(p));
 }
 
 // ==============================
-// Auto-fix vulnerable code using LLM
+// Auto-fix vulnerable code
 // ==============================
 async function autoFixCode(
   code: string,
@@ -77,7 +72,7 @@ async function autoFixCode(
 Rewrite the following code securely.
 
 STRICT RULES:
-- Return ONLY executable code
+- ONLY executable code
 - NO comments
 - NO markdown
 - NO explanations
@@ -93,7 +88,7 @@ ${issues.map(i => `- ${i.message}`).join("\n")}
 }
 
 // ==============================
-// Handle user input
+// Main command handler
 // ==============================
 async function handleUserInput() {
   const userPrompt = await vscode.window.showInputBox({
@@ -134,7 +129,6 @@ ${userPrompt}
     return;
   }
 
-  // Immediate CRITICAL block
   if (containsCriticalPatterns(aiCode)) {
     vscode.window.showErrorMessage(
       "❌ Critical insecure patterns detected. Insertion blocked."
@@ -144,21 +138,18 @@ ${userPrompt}
 
   let issues = scanForVulnerabilities(aiCode);
 
-  // Auto-fix loop (fail-closed)
   let attempts = 0;
   while (issues.length > 0 && attempts < 2) {
     try {
       aiCode = await autoFixCode(aiCode, issues);
     } catch {
-      vscode.window.showErrorMessage(
-        "❌ Auto-fix failed. Insertion blocked."
-      );
+      vscode.window.showErrorMessage("❌ Auto-fix failed.");
       return;
     }
 
     if (containsCriticalPatterns(aiCode)) {
       vscode.window.showErrorMessage(
-        "❌ Critical insecure patterns remain after auto-fix."
+        "❌ Critical issues remain after auto-fix."
       );
       return;
     }
@@ -169,7 +160,7 @@ ${userPrompt}
 
   if (issues.some(i => i.severity === "CRITICAL")) {
     vscode.window.showErrorMessage(
-      "❌ Critical security issues detected. Code insertion blocked."
+      "❌ Critical security issues detected."
     );
     return;
   }
@@ -177,7 +168,7 @@ ${userPrompt}
   const decision = await vscode.window.showInformationMessage(
     issues.length === 0
       ? "✅ Security scan passed. Insert code?"
-      : "⚠️ Minor security warnings found. Insert anyway?",
+      : "⚠️ Minor warnings found. Insert anyway?",
     "Insert",
     "Cancel"
   );
@@ -188,59 +179,11 @@ ${userPrompt}
     editBuilder.insert(editor.selection.active, aiCode);
   });
 
-  await promptFixLinting(editor);
-
-  vscode.window.showInformationMessage("✅ Secure code inserted successfully");
+  vscode.window.showInformationMessage("✅ Secure code inserted");
 }
 
 // ==============================
-// ESLint logic (ESLint v9+ safe)
-// ==============================
-async function promptFixLinting(editor: vscode.TextEditor) {
-  if (
-    !editor.document.fileName.endsWith(".js") &&
-    !editor.document.fileName.endsWith(".ts")
-  ) {
-    return;
-  }
-
-  const workspaceFolders = vscode.workspace.workspaceFolders;
-  if (!workspaceFolders) return;
-
-  const workspacePath = workspaceFolders[0].uri.fsPath;
-  const eslintConfigPath = path.join(workspacePath, "eslint.config.js");
-
-  if (!fs.existsSync(eslintConfigPath)) {
-    fs.writeFileSync(
-      eslintConfigPath,
-      `
-export default [
-  {
-    files: ["**/*.js", "**/*.ts"],
-    rules: {
-      "no-unused-vars": "warn",
-      "no-eval": "error",
-      "semi": ["error", "always"],
-      "quotes": ["error", "double"]
-    }
-  }
-];
-`.trim(),
-      "utf8"
-    );
-  }
-
-  const terminal = vscode.window.createTerminal({ name: "ESLint Fix" });
-  terminal.show();
-
-  terminal.sendText(`cd "${workspacePath}"`);
-  terminal.sendText(
-    `npx eslint --config "${eslintConfigPath}" --fix "${editor.document.fileName}"`
-  );
-}
-
-// ==============================
-// Extension activation
+// Activate extension
 // ==============================
 export function activate(context: vscode.ExtensionContext) {
   const disposable = vscode.commands.registerCommand(
