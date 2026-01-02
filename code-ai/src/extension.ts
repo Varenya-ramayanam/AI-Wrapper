@@ -1,119 +1,252 @@
-import * as vscode from 'vscode'
-import * as fs from 'fs'
-import * as path from 'path'
-import { exec } from 'child_process'
-import { getAIPoweredBotResponse } from './aiIntegration'
+import * as vscode from "vscode";
+import * as fs from "fs";
+import * as path from "path";
+import { getAIPoweredBotResponse } from "./aiIntegration";
+import { scanForVulnerabilities, SecurityIssue } from "./securityScanner";
 
-// Typing Effect
-async function typeTextInEditor(editor: vscode.TextEditor, text: string) {
-    for (let i = 0; i < text.length; i++) {
-        await new Promise(resolve => setTimeout(resolve, 50))
-        editor.edit(editBuilder => {
-            editBuilder.insert(editor.selection.active, text[i])
-        })
-    }
+// ==============================
+// Detect if output is real code
+// ==============================
+function looksLikeCode(code: string): boolean {
+  return /(import|export|const|let|var|function|class|\{|\};)/.test(code);
 }
 
+// ==============================
+// Sanitize AI output completely
+// ==============================
+function sanitizeAIOutput(raw: string): string {
+  let code = raw;
+
+  // Remove markdown code fences
+  code = code.replace(/```[\s\S]*?```/g, block =>
+    block.replace(/```/g, "")
+  );
+
+  // Remove markdown bullets & headings
+  code = code.replace(/^[-*#].*$/gm, "");
+
+  // Remove ALL block comments (even unterminated)
+  code = code.replace(/\/\*[\s\S]*?(?:\*\/|$)/g, "");
+
+  // Remove single-line comments
+  code = code.replace(/\/\/.*$/gm, "");
+
+  // Remove common LLM chatter
+  code = code.replace(
+    /\b(here is|this code|example|explanation|sure|below|note that)\b/gi,
+    ""
+  );
+
+  code = code.trim();
+
+  if (!code || code.includes("/*") || code.includes("```")) {
+    throw new Error("Malformed AI output");
+  }
+
+  if (!looksLikeCode(code)) {
+    throw new Error("Non-code AI response blocked");
+  }
+
+  return code;
+}
+
+// ==============================
+// Pre-block CRITICAL patterns
+// ==============================
+function containsCriticalPatterns(code: string): boolean {
+  const dangerous = [
+    "eval(",
+    "Function(",
+    "child_process.exec(",
+    "innerHTML",
+    "document.write(",
+    "new Buffer("
+  ];
+
+  return dangerous.some(p => code.includes(p));
+}
+
+// ==============================
+// Auto-fix vulnerable code using LLM
+// ==============================
+async function autoFixCode(
+  code: string,
+  issues: SecurityIssue[]
+): Promise<string> {
+  const prompt = `
+Rewrite the following code securely.
+
+STRICT RULES:
+- Return ONLY executable code
+- NO comments
+- NO markdown
+- NO explanations
+- Follow OWASP Top 10
+- Use secure defaults
+
+Security issues:
+${issues.map(i => `- ${i.message}`).join("\n")}
+`;
+
+  const fixed = await getAIPoweredBotResponse(prompt + "\n\n" + code);
+  return sanitizeAIOutput(fixed);
+}
+
+// ==============================
 // Handle user input
+// ==============================
 async function handleUserInput() {
-    const prompt = await vscode.window.showInputBox({
-        prompt: "Please enter your prompt"
-    })
+  const userPrompt = await vscode.window.showInputBox({
+    prompt: "Enter your prompt for AI code generation"
+  });
 
-    if (prompt === undefined) return
+  if (!userPrompt) return;
 
-    const editor = vscode.window.activeTextEditor
-    if (!editor) return
+  const editor = vscode.window.activeTextEditor;
+  if (!editor) return;
 
-    // Display loading message
-    editor.edit(editBuilder => {
-        editBuilder.insert(editor.selection.active, 'Fetching Response ...')
-    })
+  vscode.window.showInformationMessage("Generating secure code...");
 
-    // Fetch Bot Response
-    const botResponse = await getAIPoweredBotResponse(prompt)
+  const aiPrompt = `
+Generate executable code.
 
-    // Remove loading message
-    const loadingMessageLength = 'Fetching Response ...'.length
-    editor.edit(editBuilder => {
-        editBuilder.delete(
-            new vscode.Range(
-                editor.selection.active.translate(0, -loadingMessageLength),
-                editor.selection.active
-            )
-        )
-    })
+STRICT RULES:
+- ONLY code
+- NO comments
+- NO markdown
+- NO explanations
+- Follow OWASP Top 10
 
-    // Simulate typing effect for the bot Response
-    await typeTextInEditor(editor, botResponse)
+Request:
+${userPrompt}
+`;
 
-    // Display completion
-    vscode.window.showInformationMessage('Response received and typed')
+  let aiCode: string;
 
-    // --- NEW: Check for linting errors and prompt to fix ---
-    await promptFixLinting(editor)
+  try {
+    aiCode = sanitizeAIOutput(
+      await getAIPoweredBotResponse(aiPrompt)
+    );
+  } catch (err: any) {
+    vscode.window.showErrorMessage(
+      "❌ Unsafe AI output blocked: " + err.message
+    );
+    return;
+  }
+
+  // Immediate CRITICAL block
+  if (containsCriticalPatterns(aiCode)) {
+    vscode.window.showErrorMessage(
+      "❌ Critical insecure patterns detected. Insertion blocked."
+    );
+    return;
+  }
+
+  let issues = scanForVulnerabilities(aiCode);
+
+  // Auto-fix loop (fail-closed)
+  let attempts = 0;
+  while (issues.length > 0 && attempts < 2) {
+    try {
+      aiCode = await autoFixCode(aiCode, issues);
+    } catch {
+      vscode.window.showErrorMessage(
+        "❌ Auto-fix failed. Insertion blocked."
+      );
+      return;
+    }
+
+    if (containsCriticalPatterns(aiCode)) {
+      vscode.window.showErrorMessage(
+        "❌ Critical insecure patterns remain after auto-fix."
+      );
+      return;
+    }
+
+    issues = scanForVulnerabilities(aiCode);
+    attempts++;
+  }
+
+  if (issues.some(i => i.severity === "CRITICAL")) {
+    vscode.window.showErrorMessage(
+      "❌ Critical security issues detected. Code insertion blocked."
+    );
+    return;
+  }
+
+  const decision = await vscode.window.showInformationMessage(
+    issues.length === 0
+      ? "✅ Security scan passed. Insert code?"
+      : "⚠️ Minor security warnings found. Insert anyway?",
+    "Insert",
+    "Cancel"
+  );
+
+  if (decision !== "Insert") return;
+
+  await editor.edit(editBuilder => {
+    editBuilder.insert(editor.selection.active, aiCode);
+  });
+
+  await promptFixLinting(editor);
+
+  vscode.window.showInformationMessage("✅ Secure code inserted successfully");
 }
 
-// Function to check ESLint and fix
+// ==============================
+// ESLint logic (ESLint v9+ safe)
+// ==============================
 async function promptFixLinting(editor: vscode.TextEditor) {
-    if (!editor.document.fileName.endsWith('.js') && !editor.document.fileName.endsWith('.ts')) {
-        return // Only run for JS/TS files
-    }
+  if (
+    !editor.document.fileName.endsWith(".js") &&
+    !editor.document.fileName.endsWith(".ts")
+  ) {
+    return;
+  }
 
-    const workspaceFolders = vscode.workspace.workspaceFolders
-    if (!workspaceFolders) return
-    const workspacePath = workspaceFolders[0].uri.fsPath
+  const workspaceFolders = vscode.workspace.workspaceFolders;
+  if (!workspaceFolders) return;
 
-    const eslintConfigPath = path.join(workspacePath, 'eslint.config.js')
+  const workspacePath = workspaceFolders[0].uri.fsPath;
+  const eslintConfigPath = path.join(workspacePath, "eslint.config.js");
 
-    // Check if ESLint config exists; if not, create it
-    if (!fs.existsSync(eslintConfigPath)) {
-        const defaultConfig = `import { FlatCompat } from "eslint-define-config";
-const compat = FlatCompat.fromESLint();
+  if (!fs.existsSync(eslintConfigPath)) {
+    fs.writeFileSync(
+      eslintConfigPath,
+      `
 export default [
-    ...compat.extends("eslint:recommended"),
-    {
-        files: ["*.js", "*.ts"],
-        rules: {
-            "no-unused-vars": "warn",
-            "semi": ["error", "always"],
-            "quotes": ["error", "double"]
-        },
-    },
-];`
-        fs.writeFileSync(eslintConfigPath, defaultConfig, { encoding: 'utf8' })
-        vscode.window.showInformationMessage('Created default eslint.config.js in workspace.')
+  {
+    files: ["**/*.js", "**/*.ts"],
+    rules: {
+      "no-unused-vars": "warn",
+      "no-eval": "error",
+      "semi": ["error", "always"],
+      "quotes": ["error", "double"]
     }
+  }
+];
+`.trim(),
+      "utf8"
+    );
+  }
 
-    // Install necessary ESLint packages if not present
-    const nodeModulesPath = path.join(workspacePath, 'node_modules')
-    if (!fs.existsSync(nodeModulesPath) || !fs.existsSync(path.join(nodeModulesPath, 'eslint'))) {
-        vscode.window.showInformationMessage('Installing ESLint packages...')
-        exec(`npm install eslint eslint-define-config --save-dev`, { cwd: workspacePath }, (error, stdout, stderr) => {
-            if (error) {
-                vscode.window.showErrorMessage(`Error installing ESLint: ${error.message}`)
-                return
-            }
-            vscode.window.showInformationMessage('ESLint packages installed successfully.')
-            runEslintFix(editor, eslintConfigPath)
-        })
-    } else {
-        runEslintFix(editor, eslintConfigPath)
-    }
+  const terminal = vscode.window.createTerminal({ name: "ESLint Fix" });
+  terminal.show();
+
+  terminal.sendText(`cd "${workspacePath}"`);
+  terminal.sendText(
+    `npx eslint --config "${eslintConfigPath}" --fix "${editor.document.fileName}"`
+  );
 }
 
-// Run ESLint fix on the current file
-function runEslintFix(editor: vscode.TextEditor, eslintConfigPath: string) {
-    const terminal = vscode.window.createTerminal({ name: 'ESLint Fix' })
-    terminal.show()
-    terminal.sendText(`npx eslint --config "${eslintConfigPath}" --fix "${editor.document.fileName}"`)
-    vscode.window.showInformationMessage('ESLint fix applied to current file.')
-}
-
-// Activate extension
+// ==============================
+// Extension activation
+// ==============================
 export function activate(context: vscode.ExtensionContext) {
-    let disposable = vscode.commands.registerCommand('extension.getAIPoweredBotResponse', async () => {
-        await handleUserInput()
-    })
-    context.subscriptions.push(disposable)
+  const disposable = vscode.commands.registerCommand(
+    "extension.getAIPoweredBotResponse",
+    handleUserInput
+  );
+
+  context.subscriptions.push(disposable);
 }
